@@ -65,4 +65,89 @@ function Base.setindex!(flux::Flux, value::String, key::String)
     value
 end
 
+mutable struct Future
+    handle::API.flux_future_t
+    refs::IdDict{Any, Nothing}
+    function Future(handle)
+        this = new(handle, IdDict{Any, Nothing}())
+        finalizer(this) do future
+            API.flux_future_destroy(future.handle)
+        end
+        return this
+    end
+end
+
+function lookup(flux::Flux, key, ns=C_NULL, flags=0)
+    handle = API.flux_kvs_lookup(flux, ns, flags, key)
+    Libc.systemerror("flux_kvs_lookup", handle == C_NULL)
+    return Future(handle)
+end
+
+function get(future::Future)
+    data = Ref{Ptr{Void}}()
+    len = Ref{Cint}()
+    API.flux_kvs_lookup_get_raw(future.handle, data, len)
+    Base.unsafe_string(data[], len[])
+end
+
+mutable struct Transaction
+    handle::API.flux_kvs_txn_t
+    function Transaction()
+        handle = API.flux_kvs_txn_create()
+        this = new(handle)
+        finalizer(this) do txn
+            API.flux_kvs_txn_destroy(txn.handle)
+        end
+    end
+    return this
+end
+
+function commit(flux::Flux, txn::Transaction, ns=C_NULL; flags=0)
+    handle = API.flux_kvs_commit(flux, ns, flags, txn.handle)
+    Libc.systemerror("flux_kvs_commit", handle == C_NULL)
+    fut = Future(handle)
+    fut.refs[txn] = nothing # root txn in fut
+    return fut
+end
+
+function fence(flux::Flux, txn::Transaction, name, nprocs, ns=C_NULL; flags=0)
+    handle = API.flux_kvs_fence(flux, ns, flags, name, nprocs, txn.handle)
+    Libc.systemerror("flux_kvs_fence", handle == C_NULL)
+    fut = Future(handle)
+    fut.refs[txn] = nothing # root txn in fut
+    return fut
+end
+
+mutable struct KVS
+    flux::Flux
+    namespace::String
+    current_txn::Transaction
+    lock::Base.ReentrantLock()
+    function KVS(flux::Flux, namespace)
+        new(flux, namespace, Transaction(), Base.ReentrantLock())
+    end
+end
+function exchange_transaction!(kvs::KVS)
+    txn = lock(kvs) do
+        txn = kvs.current_txn
+        kvs.current_txn = Transaction()
+        txn
+    end
+    return txn
+end
+
+function commit(kvs::KVS)
+    txn = exchange_transaction!(kvs)
+    commit(kvs.flux, txn, kvs.namespace)
+end
+
+function fence(kvs::KVS, name, nprocs)
+    txn = exchange_transaction!(kvs)
+    fence(kvs.flux, txn, name, nprocs, kvs.namespace)
+end
+
+function lookup(kvs::KVS, key)
+    lookup(kvs.flux, key, kvs.namespace)
+end
+
 end # module
